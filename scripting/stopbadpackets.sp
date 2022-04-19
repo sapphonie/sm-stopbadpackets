@@ -1,6 +1,7 @@
 #include <sdktools>
 #include <dhooks>
 #include <discord>
+#include <profiler>
 
 // each channel packet has 1 byte of FLAG bits
 #define PACKET_FLAG_RELIABLE            (1<<0)  // packet contains subchannel stream data
@@ -11,17 +12,22 @@
 #define PACKET_FLAG_CHALLENGE           (1<<5)  // packet contains challenge number, use to prevent packet injection
 #define PACKET_FLAG_IDK                 (1<<6)  // who freakin knows man
 
+// this should be a constant in sm...
+Address NULL = view_as<Address>(0x0);
 
-
-int evilPacketsFor[MAXPLAYERS+1];
 
 Handle hGameData;
 
-Handle SDKCall_AddrToString;
-Handle SDKCall_GetAddress;
+Handle SDKCall_GetPlayerSlot;
+
+Handle profiler;
 
 ConVar sm_max_bad_packets_sec;
 ConVar sm_max_packet_processing_time_msec;
+
+int evilPacketsFor          [MAXPLAYERS+1];
+float proctimeThisSecondFor [MAXPLAYERS+1];
+int ticks                   [MAXPLAYERS+1];
 
 public void OnPluginStart()
 {
@@ -74,34 +80,19 @@ public void OnPluginStart()
     }
     PrintToServer("CNetChan::ProcessPacket hooked!");
 
-    if (GetEngineVersion() != Engine_CSGO)
-    {
-        // for getting ip address from netpacket*
-        StartPrepSDKCall(SDKCall_Raw);
-        if (!PrepSDKCall_SetFromConf(hGameData, SDKConf_Signature, "netadr_s::ToString"))
-        {
-            SetFailState("Failed to get netadr_s::ToString");
-        }
-        PrepSDKCall_AddParameter(SDKType_Bool, SDKPass_ByValue);
-        PrepSDKCall_SetReturnInfo(SDKType_String, SDKPass_Pointer);
-        SDKCall_AddrToString = EndPrepSDKCall();
-        PrintToServer("netadr_s::ToString set up!");
-    }
-    else
-    {
-        int offset = GameConfGetOffset(hGameData, "Offset_ToString");
-        StartPrepSDKCall(SDKCall_Raw);
-        PrepSDKCall_SetVirtual(offset / 4);
-        PrepSDKCall_SetReturnInfo(SDKType_String, SDKPass_Pointer);
-        SDKCall_GetAddress = EndPrepSDKCall();
-    }
+    StartPrepSDKCall(SDKCall_Raw);
+    PrepSDKCall_SetFromConf(hGameData, SDKConf_Virtual, "CBaseClient::GetPlayerSlot");
+    PrepSDKCall_SetReturnInfo(SDKType_PlainOldData, SDKPass_Plain);
+    SDKCall_GetPlayerSlot = EndPrepSDKCall();
+    PrintToServer("CBaseClient::GetPlayerSlot set up!");
+
 
     sm_max_bad_packets_sec =
     CreateConVar
     (
         "sm_max_bad_packets_sec",
-        "5",
-        "[StopBadPackets] Max invalid packets a client is allowed to send, per second. Default 5.",
+        "25",
+        "[StopBadPackets] Max invalid packets a client is allowed to send, per second. Default 20.",
         FCVAR_NONE,
         true,
         1.0,
@@ -114,151 +105,92 @@ public void OnPluginStart()
     (
         "sm_max_packet_processing_time_msec",
         "20",
-        "[StopBadPackets] Max time the client is allowed to make the server spend processing packets, in msec. Default 5.",
+        "[StopBadPackets] Max time the client is allowed to make the server spend processing packets, in msec. Default 20.",
         FCVAR_NONE,
         true,
-        1.0,
+        0.0,
         false,
         _
     );
 
+    CreateTimer(1.0, ShowInfoToPlayersAndPunish, _, TIMER_REPEAT);
 
+    profiler = CreateProfiler();
 }
 
-float preproc_time;
-float postproc_time;
+public Action ShowInfoToPlayersAndPunish(Handle timer)
+{
+    for (int client = 1; client <= MaxClients; client++)
+    {
+        if (GetConVarFloat(sm_max_packet_processing_time_msec) == 0.0)
+        {
+            proctimeThisSecondFor[client] = 0.0;
+            ticks[client] = 0;
 
-int lastTick;
-int thisTick;
+            // don't run the rest of this logic :P
+            continue;
+        }
+        if (IsValidClient(client))
+        {
+            if (proctimeThisSecondFor[client] > GetConVarFloat(sm_max_packet_processing_time_msec) / 1000)
+            {
+                char hookmsg[256];
+                Format(hookmsg, sizeof(hookmsg), "[StopBadPackets] Client -%L- spent [%.2fms] in the last second processing a packet - sm_max_packet_processing_time_msec = %.2f", client, proctimeThisSecondFor[client]*1000.0, GetConVarFloat(sm_max_packet_processing_time_msec));
+                Discord_SendMessage("badpackets", hookmsg);
+
+                // KickClient(client, "[StopBadPackets] Client %N took too long to process a packet", client);
+                PrintToServer("%s", hookmsg);
+            }
+            PrintToServer("%N - %f.", client, proctimeThisSecondFor[client] * 1000);
+            PrintToServer("%N - %i ticks.", client, ticks[client]);
+        }
+        proctimeThisSecondFor[client] = 0.0;
+        ticks[client] = 0;
+    }
+    return Plugin_Continue;
+}
+
 
 public MRESReturn Detour_ProcessPacket(int pThis, DHookParam hParams)
 {
-    // engine time before processing this packet
-    preproc_time = GetEngineTime();
-
-
+    StartProfiling(profiler);
     int offset = GameConfGetOffset(hGameData, "Offset_PacketSize");
 
     // Get size of this packet
     Address netpacket = DHookGetParamAddress(hParams, 1);
     int size = LoadFromAddress((netpacket + view_as<Address>(offset)), NumberType_Int32);
 
-    // LogMessage("size %i", size);
-
     // sanity check
-    if (size < 0 )// || size > 4096)
+    if (size < 8 || size >= 2048)
     {
-        char naughtyaddr[64];
-        naughtyaddr = GetIPFromThis(pThis);
-        for (int client = 1; client <= MaxClients; client++)
+        int client = GetClientFromThis(pThis);
+        if (IsValidClient(client))
         {
-            if (IsValidClient(client))
-            {
-                char ip[64];
-                // Pass false so we get the port too!
-                GetClientIP(client, ip, sizeof(ip), false);
-                // Found them!
-                if (StrEqual(ip, naughtyaddr))
-                {
-                    char hookmsg[256];
-                    Format(hookmsg, sizeof(hookmsg), "[StopBadPackets] Client -%L- sent a packet with < 0 size! size: %i", client, size);
-                    // Discord_SendMessage("badpackets", hookmsg);
-
-                    // KickClient(client, "[StopBadPackets] Client %N sent a packet with no size!", client);
-                    PrintToServer("[StopBadPackets] Client %N sent a packet with no size!", client);
-                }
-            }
+            char hookmsg[256];
+            Format(hookmsg, sizeof(hookmsg), "[StopBadPackets] Client -%L- sent a packet with a sussy size: [%i]", client, size);
+            Discord_SendMessage("badpackets", hookmsg);
+            PrintToServer("%s", hookmsg);
+            // KickClient(client, "[StopBadPackets] Client %N sent a packet with a sussy size!", client);
+            // return MRES_Supercede;
         }
-        return MRES_Supercede;
     }
     return MRES_Ignored;
 }
 
-
-float thisProcDelta;
-float lastProcDelta;
-
-float lastTotalProc;
-float thisTotalProc;
-
-float proctime_ms;
 // this isn't a detour but shut up
 public MRESReturn Detour_ProcessPacketPost(int pThis, DHookParam hParams)
 {
-    // engine time after processing this packet
-    postproc_time = GetEngineTime();
-
-    lastProcDelta = thisProcDelta;
-    thisProcDelta = (postproc_time - preproc_time) * 1000.0;
-
-    lastTick = thisTick;
-    thisTick = GetGameTickCount();
-
-    int tickDelta = thisTick - lastTick;
-
-    LogMessage("\
-    \n    preproc %f\
-    \n    postproc %f\
-    \n    lastProcDelta %f\
-    \n    thisProcDelta %f\
-    \n    lastTick %i\
-    \n    thisTick %i\
-    \n    tickdelta %i\
-    ",
-    preproc_time,
-    postproc_time,
-    lastProcDelta,
-    thisProcDelta,
-    lastTick,
-    thisTick,
-    tickDelta);
-
-
-    lastTotalProc = thisTotalProc;
-
-    if (tickDelta == 0)
+    StopProfiling(profiler);
+    int client = GetClientFromThis(pThis);
+    // LogMessage("%N", client);
+    if (IsValidClient(client))
     {
-        thisTotalProc = thisProcDelta + lastProcDelta + lastTotalProc;
+        ticks[client]++;
+        proctimeThisSecondFor[client] += GetProfilerTime(profiler);
+        // LogMessage("%i %f %N", ticks[client], proctimeThisSecondFor[client], client);
     }
-    else
-    {
-        thisTotalProc = thisProcDelta / tickDelta;
-    }
-
-    LogMessage("thisTotalProc %.2f", thisTotalProc);
-
     return MRES_Ignored;
-    // we spent this long processing this packet
-    // LogMessage("proctime %.2fms", proctime_ms);
 
-    // 
-    if (proctime_ms >= GetConVarFloat(sm_max_packet_processing_time_msec))
-    {
-        char naughtyaddr[64];
-        naughtyaddr = GetIPFromThis(pThis);
-        for (int client = 1; client <= MaxClients; client++)
-        {
-            if (IsValidClient(client))
-            {
-                char ip[64];
-                // Pass false so we get the port too!
-                GetClientIP(client, ip, sizeof(ip), false);
-                // Found them!
-                if (StrEqual(ip, naughtyaddr))
-                {
-                    char hookmsg[256];
-                    Format(hookmsg, sizeof(hookmsg), "[StopBadPackets] Client -%L- took %.2fms to process a packet - sm_max_bad_packets_sec = %.2f", client, proctime_ms, GetConVarFloat(sm_max_packet_processing_time_msec));
-                    // Discord_SendMessage("badpackets", hookmsg);
-
-                    // KickClient(client, "[StopBadPackets] Client %N took too long to process a packet", client);
-                    PrintToServer("[StopBadPackets] Client %N took too long to process a packet", client);
-                }
-            }
-        }
-
-    }
-
-    return MRES_Ignored;
 }
 
 public MRESReturn Detour_ProcessPacketHeader(int pThis, DHookReturn hReturn, DHookParam hParams)
@@ -305,85 +237,31 @@ public MRESReturn Detour_ProcessPacketHeader(int pThis, DHookReturn hReturn, DHo
     // Packet was invalid somehow.
     if (ret == -1)
     {
-        char naughtyaddr[64];
-        naughtyaddr = GetIPFromThis(pThis);
+        int client = GetClientFromThis(pThis);
+        evilPacketsFor[client]++;
+        PrintToServer("[StopBadPackets] Client %N sent an invalid packet. Detections within the last second: %i", client, evilPacketsFor[client]);
 
-        // Now I *could* sdkcall here. But you see, I am lazy.
-        // Let's loop thru our clients to see who has this same ip address.
-        for (int client = 1; client <= MaxClients; client++)
+        // expire this detection in 1 second
+        int userid = GetClientUserId(client);
+        CreateTimer(1.0, Timer_decr_BadPacket, userid, TIMER_FLAG_NO_MAPCHANGE);
+
+        if (evilPacketsFor[client] % 5 == 0)
         {
-            if (IsValidClient(client))
-            {
-                char ip[64];
-                // Pass false so we get the port too!
-                GetClientIP(client, ip, sizeof(ip), false);
-                // Found them!
-                if (StrEqual(ip, naughtyaddr))
-                {
-                    evilPacketsFor[client]++;
-                    PrintToServer("[StopBadPackets] Client %N sent an invalid packet. Detections within the last second: %i", client, evilPacketsFor[client]);
+            char hookmsg[256];
+            Format(hookmsg, sizeof(hookmsg), "[StopBadPackets] Client -%L- sent too many invalid packets [%i]/s - sm_max_bad_packets_sec = %.2f", client, evilPacketsFor[client], GetConVarFloat(sm_max_bad_packets_sec));
+            Discord_SendMessage("badpackets", hookmsg);
+        }
 
-                    // expire this detection in 1 second
-                    int userid = GetClientUserId(client);
-                    CreateTimer(1.0, Timer_decr_BadPacket, userid, TIMER_FLAG_NO_MAPCHANGE);
-
-                    if (evilPacketsFor[client] == 1 || evilPacketsFor[client] % 5 == 0)
-                    {
-                        char hookmsg[256];
-                        Format(hookmsg, sizeof(hookmsg), "[StopBadPackets] Client -%L- sent too many invalid packets [%i]/s - sm_max_bad_packets_sec = %.2f", client, evilPacketsFor[client], GetConVarFloat(sm_max_bad_packets_sec));
-                        // Discord_SendMessage("badpackets", hookmsg);
-                    }
-
-                    if (evilPacketsFor[client] >= GetConVarFloat(sm_max_bad_packets_sec))
-                    {
-                        // KickClient(client, "[StopBadPackets] Client %N sent too many invalid packets", client);
-                        PrintToServer("[StopBadPackets] Client %N sent too many invalid packets", client);
-                    }
-                }
-            }
+        if (evilPacketsFor[client] >= GetConVarFloat(sm_max_bad_packets_sec))
+        {
+            // KickClient(client, "[StopBadPackets] Client %N sent too many invalid packets", client);
+            PrintToServer("[StopBadPackets] Client %N sent too many invalid packets", client);
         }
     }
 
     return MRES_Ignored;
 }
 
-
-char[] GetIPFromThis(any pThis)
-{
-    if (GetEngineVersion() != Engine_CSGO)
-    {
-        return AdrToString(pThis);
-    }
-    else
-    {
-        return GetAddress(pThis);
-    }
-}
-
-char[] AdrToString(any pThis)
-{
-    // Let's get the ip address+port of this evil packet.
-    char naughtyaddr[64];
-
-    // Ghidra says:
-    // char* ip = netadr_s::ToString((netadr_s *)(this + <game offset>), false);
-    // So let's just recreate that.
-
-    int offset = GameConfGetOffset(hGameData, "Offset_ToString");
-    SDKCall(SDKCall_AddrToString, (pThis + offset), naughtyaddr, sizeof(naughtyaddr));
-
-    PrintToServer("%s", naughtyaddr);
-    return naughtyaddr;
-}
-
-char[] GetAddress(any pThis)
-{
-    char naughtyaddr[64];
-    SDKCall(SDKCall_GetAddress, pThis, naughtyaddr, sizeof(naughtyaddr));
-    PrintToServer("%s", naughtyaddr);
-
-    return naughtyaddr;
-}
 
 Action Timer_decr_BadPacket(Handle timer, any userid)
 {
@@ -417,7 +295,7 @@ bool IsValidClient(int client)
     (
         (0 < client <= MaxClients)
         && IsClientInGame(client)
-        && !IsClientInKickQueue(client)
+        && !IsFakeClient(client)
     )
     {
         return true;
@@ -425,43 +303,30 @@ bool IsValidClient(int client)
     return false;
 }
 
-// oh dear god
-/**
- * Loads a null-terminated string from the given address.
- * 
- * The function will return an empty string if the address corresponds to a nullptr.  This
- * functionality is present as a workaround for when an SDKCall that expects a char pointer
- * receives a nullptr and attempts to dereference it (see alliedmodders/sourcemod/issues/874).
- * 
- * If it is necessary to differentiate between an empty string and a null pointer, check if addr
- * is null before calling the function, or pass a reference to bIsNullPointer.
- * 
- * @return Number of bytes written.  0 is returned on an empty string or a null pointer.
- */
-stock int LoadStringFromAddress(Address addr, char[] buffer, int maxlen,
-        bool &bIsNullPointer = false) {
-    if (!addr) {
-        bIsNullPointer = true;
+// This looks simple but it took literally 6 hours to figure out
+int GetClientFromThis(any pThis)
+{
+    if (pThis == NULL)
+    {
+        LogMessage("pThis == NULL!")
         return 0;
     }
-    
-    int c;
-    char ch;
-    do {
-        ch = view_as<int>(LoadFromAddress(addr + view_as<Address>(c), NumberType_Int8));
-        buffer[c] = ch;
-    } while (ch && ++c < maxlen - 1);
-    return c;
+    int offset  = GameConfGetOffset(hGameData, "Offset_MessageHandler");
+    Address IClient = DerefPtr(pThis + offset );
+    // Address IClient = pThis + offset;
+    if (IClient == NULL)
+    {
+        LogMessage("IClient == NULL!")
+        return 0;
+    }
+    int client = SDKCall(SDKCall_GetPlayerSlot, IClient) + 1;
+    return client;
 }
 
-/**
- * Reads a value stored in a memory address and returns it as an address.
- * This currently assumes a 32-bit platform.
- * 
- * @param addr          Address to a memory location.
- * @return              The value stored in the given address as an Address.
- */
-stock Address DereferencePointer(Address addr) {
-    // maybe someday we'll do 64-bit addresses
+
+Address DerefPtr(Address addr)
+{
     return view_as<Address>(LoadFromAddress(addr, NumberType_Int32));
 }
+
+
