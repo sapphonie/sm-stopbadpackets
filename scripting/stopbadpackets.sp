@@ -16,7 +16,9 @@
 int evilPacketsFor[MAXPLAYERS+1];
 
 Handle hGameData;
-Handle netadr_ToString;
+
+Handle SDKCall_AddrToString;
+Handle SDKCall_GetAddress;
 
 ConVar sm_max_bad_packets_sec;
 ConVar sm_max_packet_processing_time_msec;
@@ -72,19 +74,27 @@ public void OnPluginStart()
     }
     PrintToServer("CNetChan::ProcessPacket hooked!");
 
-
-    // for getting ip address from netpacket*
-    StartPrepSDKCall(SDKCall_Raw);
-    if (!PrepSDKCall_SetFromConf(hGameData, SDKConf_Signature, "netadr_s::ToString"))
+    if (GetEngineVersion() != Engine_CSGO)
     {
-        SetFailState("Failed to get netadr_s::ToString");
+        // for getting ip address from netpacket*
+        StartPrepSDKCall(SDKCall_Raw);
+        if (!PrepSDKCall_SetFromConf(hGameData, SDKConf_Signature, "netadr_s::ToString"))
+        {
+            SetFailState("Failed to get netadr_s::ToString");
+        }
+        PrepSDKCall_AddParameter(SDKType_Bool, SDKPass_ByValue);
+        PrepSDKCall_SetReturnInfo(SDKType_String, SDKPass_Pointer);
+        SDKCall_AddrToString = EndPrepSDKCall();
+        PrintToServer("netadr_s::ToString set up!");
     }
-    PrepSDKCall_AddParameter(SDKType_Bool, SDKPass_ByValue);
-    PrepSDKCall_SetReturnInfo(SDKType_String, SDKPass_Pointer);
-    netadr_ToString = EndPrepSDKCall();
-    PrintToServer("netadr_s::ToString set up!");
-
-
+    else
+    {
+        int offset = GameConfGetOffset(hGameData, "Offset_ToString");
+        StartPrepSDKCall(SDKCall_Raw);
+        PrepSDKCall_SetVirtual(offset / 4);
+        PrepSDKCall_SetReturnInfo(SDKType_String, SDKPass_Pointer);
+        SDKCall_GetAddress = EndPrepSDKCall();
+    }
 
     sm_max_bad_packets_sec =
     CreateConVar
@@ -118,10 +128,14 @@ public void OnPluginStart()
 float preproc_time;
 float postproc_time;
 
+int lastTick;
+int thisTick;
+
 public MRESReturn Detour_ProcessPacket(int pThis, DHookParam hParams)
 {
     // engine time before processing this packet
     preproc_time = GetEngineTime();
+
 
     int offset = GameConfGetOffset(hGameData, "Offset_PacketSize");
 
@@ -129,11 +143,13 @@ public MRESReturn Detour_ProcessPacket(int pThis, DHookParam hParams)
     Address netpacket = DHookGetParamAddress(hParams, 1);
     int size = LoadFromAddress((netpacket + view_as<Address>(offset)), NumberType_Int32);
 
+    // LogMessage("size %i", size);
+
     // sanity check
-    if (size < 0)
+    if (size < 0 )// || size > 4096)
     {
         char naughtyaddr[64];
-        naughtyaddr = AdrToString(pThis);
+        naughtyaddr = GetIPFromThis(pThis);
         for (int client = 1; client <= MaxClients; client++)
         {
             if (IsValidClient(client))
@@ -145,8 +161,8 @@ public MRESReturn Detour_ProcessPacket(int pThis, DHookParam hParams)
                 if (StrEqual(ip, naughtyaddr))
                 {
                     char hookmsg[256];
-                    Format(hookmsg, sizeof(hookmsg), "[StopBadPackets] Client -%L- sent a packet with < 1 size! size: %i", client, size);
-                    Discord_SendMessage("badpackets", hookmsg);
+                    Format(hookmsg, sizeof(hookmsg), "[StopBadPackets] Client -%L- sent a packet with < 0 size! size: %i", client, size);
+                    // Discord_SendMessage("badpackets", hookmsg);
 
                     // KickClient(client, "[StopBadPackets] Client %N sent a packet with no size!", client);
                     PrintToServer("[StopBadPackets] Client %N sent a packet with no size!", client);
@@ -158,16 +174,60 @@ public MRESReturn Detour_ProcessPacket(int pThis, DHookParam hParams)
     return MRES_Ignored;
 }
 
+
+float thisProcDelta;
+float lastProcDelta;
+
+float lastTotalProc;
+float thisTotalProc;
+
+float proctime_ms;
 // this isn't a detour but shut up
 public MRESReturn Detour_ProcessPacketPost(int pThis, DHookParam hParams)
 {
     // engine time after processing this packet
     postproc_time = GetEngineTime();
 
-    // get delta
-    float proctime = postproc_time - preproc_time;
-    float proctime_ms = proctime * 1000.0;
+    lastProcDelta = thisProcDelta;
+    thisProcDelta = (postproc_time - preproc_time) * 1000.0;
 
+    lastTick = thisTick;
+    thisTick = GetGameTickCount();
+
+    int tickDelta = thisTick - lastTick;
+
+    LogMessage("\
+    \n    preproc %f\
+    \n    postproc %f\
+    \n    lastProcDelta %f\
+    \n    thisProcDelta %f\
+    \n    lastTick %i\
+    \n    thisTick %i\
+    \n    tickdelta %i\
+    ",
+    preproc_time,
+    postproc_time,
+    lastProcDelta,
+    thisProcDelta,
+    lastTick,
+    thisTick,
+    tickDelta);
+
+
+    lastTotalProc = thisTotalProc;
+
+    if (tickDelta == 0)
+    {
+        thisTotalProc = thisProcDelta + lastProcDelta + lastTotalProc;
+    }
+    else
+    {
+        thisTotalProc = thisProcDelta / tickDelta;
+    }
+
+    LogMessage("thisTotalProc %.2f", thisTotalProc);
+
+    return MRES_Ignored;
     // we spent this long processing this packet
     // LogMessage("proctime %.2fms", proctime_ms);
 
@@ -175,7 +235,7 @@ public MRESReturn Detour_ProcessPacketPost(int pThis, DHookParam hParams)
     if (proctime_ms >= GetConVarFloat(sm_max_packet_processing_time_msec))
     {
         char naughtyaddr[64];
-        naughtyaddr = AdrToString(pThis);
+        naughtyaddr = GetIPFromThis(pThis);
         for (int client = 1; client <= MaxClients; client++)
         {
             if (IsValidClient(client))
@@ -188,7 +248,7 @@ public MRESReturn Detour_ProcessPacketPost(int pThis, DHookParam hParams)
                 {
                     char hookmsg[256];
                     Format(hookmsg, sizeof(hookmsg), "[StopBadPackets] Client -%L- took %.2fms to process a packet - sm_max_bad_packets_sec = %.2f", client, proctime_ms, GetConVarFloat(sm_max_packet_processing_time_msec));
-                    Discord_SendMessage("badpackets", hookmsg);
+                    // Discord_SendMessage("badpackets", hookmsg);
 
                     // KickClient(client, "[StopBadPackets] Client %N took too long to process a packet", client);
                     PrintToServer("[StopBadPackets] Client %N took too long to process a packet", client);
@@ -204,7 +264,7 @@ public MRESReturn Detour_ProcessPacketPost(int pThis, DHookParam hParams)
 public MRESReturn Detour_ProcessPacketHeader(int pThis, DHookReturn hReturn, DHookParam hParams)
 {
     int ret             = DHookGetReturn(hReturn);
-    Address netpacket   = DHookGetParamAddress(hParams, 1);
+    // Address netpacket   = DHookGetParamAddress(hParams, 1);
 
     /*
     char flags[64];
@@ -241,11 +301,12 @@ public MRESReturn Detour_ProcessPacketHeader(int pThis, DHookReturn hReturn, DHo
 
     */
 
+
     // Packet was invalid somehow.
     if (ret == -1)
     {
         char naughtyaddr[64];
-        naughtyaddr = AdrToString(pThis);
+        naughtyaddr = GetIPFromThis(pThis);
 
         // Now I *could* sdkcall here. But you see, I am lazy.
         // Let's loop thru our clients to see who has this same ip address.
@@ -270,10 +331,8 @@ public MRESReturn Detour_ProcessPacketHeader(int pThis, DHookReturn hReturn, DHo
                     {
                         char hookmsg[256];
                         Format(hookmsg, sizeof(hookmsg), "[StopBadPackets] Client -%L- sent too many invalid packets [%i]/s - sm_max_bad_packets_sec = %.2f", client, evilPacketsFor[client], GetConVarFloat(sm_max_bad_packets_sec));
-                        Discord_SendMessage("badpackets", hookmsg);
+                        // Discord_SendMessage("badpackets", hookmsg);
                     }
-
-
 
                     if (evilPacketsFor[client] >= GetConVarFloat(sm_max_bad_packets_sec))
                     {
@@ -288,23 +347,43 @@ public MRESReturn Detour_ProcessPacketHeader(int pThis, DHookReturn hReturn, DHo
     return MRES_Ignored;
 }
 
+
+char[] GetIPFromThis(any pThis)
+{
+    if (GetEngineVersion() != Engine_CSGO)
+    {
+        return AdrToString(pThis);
+    }
+    else
+    {
+        return GetAddress(pThis);
+    }
+}
+
 char[] AdrToString(any pThis)
 {
     // Let's get the ip address+port of this evil packet.
     char naughtyaddr[64];
 
     // Ghidra says:
-    // char* ip = netadr_s::ToString((netadr_s *)(this + 0x94), false);
-
+    // char* ip = netadr_s::ToString((netadr_s *)(this + <game offset>), false);
     // So let's just recreate that.
 
     int offset = GameConfGetOffset(hGameData, "Offset_ToString");
+    SDKCall(SDKCall_AddrToString, (pThis + offset), naughtyaddr, sizeof(naughtyaddr));
 
-    SDKCall(netadr_ToString, (pThis + offset), naughtyaddr, sizeof(naughtyaddr), false);
-    // PrintToServer("%s", naughtyaddr);
+    PrintToServer("%s", naughtyaddr);
     return naughtyaddr;
 }
 
+char[] GetAddress(any pThis)
+{
+    char naughtyaddr[64];
+    SDKCall(SDKCall_GetAddress, pThis, naughtyaddr, sizeof(naughtyaddr));
+    PrintToServer("%s", naughtyaddr);
+
+    return naughtyaddr;
+}
 
 Action Timer_decr_BadPacket(Handle timer, any userid)
 {
@@ -344,4 +423,45 @@ bool IsValidClient(int client)
         return true;
     }
     return false;
+}
+
+// oh dear god
+/**
+ * Loads a null-terminated string from the given address.
+ * 
+ * The function will return an empty string if the address corresponds to a nullptr.  This
+ * functionality is present as a workaround for when an SDKCall that expects a char pointer
+ * receives a nullptr and attempts to dereference it (see alliedmodders/sourcemod/issues/874).
+ * 
+ * If it is necessary to differentiate between an empty string and a null pointer, check if addr
+ * is null before calling the function, or pass a reference to bIsNullPointer.
+ * 
+ * @return Number of bytes written.  0 is returned on an empty string or a null pointer.
+ */
+stock int LoadStringFromAddress(Address addr, char[] buffer, int maxlen,
+        bool &bIsNullPointer = false) {
+    if (!addr) {
+        bIsNullPointer = true;
+        return 0;
+    }
+    
+    int c;
+    char ch;
+    do {
+        ch = view_as<int>(LoadFromAddress(addr + view_as<Address>(c), NumberType_Int8));
+        buffer[c] = ch;
+    } while (ch && ++c < maxlen - 1);
+    return c;
+}
+
+/**
+ * Reads a value stored in a memory address and returns it as an address.
+ * This currently assumes a 32-bit platform.
+ * 
+ * @param addr          Address to a memory location.
+ * @return              The value stored in the given address as an Address.
+ */
+stock Address DereferencePointer(Address addr) {
+    // maybe someday we'll do 64-bit addresses
+    return view_as<Address>(LoadFromAddress(addr, NumberType_Int32));
 }
