@@ -13,7 +13,7 @@
 #define PACKET_FLAG_IDK                 (1<<6)  // who freakin knows man
 
 // this should be a constant in sm...
-Address NULL = view_as<Address>(0x0);
+// Address NULL = view_as<Address>(0x0);
 
 
 Handle hGameData;
@@ -92,10 +92,10 @@ public void OnPluginStart()
     (
         "sm_max_bad_packets_sec",
         "25",
-        "[StopBadPackets] Max invalid packets a client is allowed to send, per second. Default 20.",
+        "[StopBadPackets] Max invalid packets a client is allowed to send, per second. Default 25.",
         FCVAR_NONE,
         true,
-        1.0,
+        0.0,
         false,
         _
     );
@@ -104,8 +104,8 @@ public void OnPluginStart()
     CreateConVar
     (
         "sm_max_packet_processing_time_msec",
-        "20",
-        "[StopBadPackets] Max time the client is allowed to make the server spend processing packets, in msec. Default 20.",
+        "50",
+        "[StopBadPackets] Max time the client is allowed to make the server spend processing packets, in msec. Default 50.",
         FCVAR_NONE,
         true,
         0.0,
@@ -113,12 +113,12 @@ public void OnPluginStart()
         _
     );
 
-    CreateTimer(1.0, ShowInfoToPlayersAndPunish, _, TIMER_REPEAT);
+    CreateTimer(1.0, CheckProcTime, _, TIMER_REPEAT);
 
     profiler = CreateProfiler();
 }
 
-public Action ShowInfoToPlayersAndPunish(Handle timer)
+public Action CheckProcTime(Handle timer)
 {
     for (int client = 1; client <= MaxClients; client++)
     {
@@ -127,7 +127,7 @@ public Action ShowInfoToPlayersAndPunish(Handle timer)
             proctimeThisSecondFor[client] = 0.0;
             ticks[client] = 0;
 
-            // don't run the rest of this logic :P
+            // don't run the rest of this logic if there's no point in kicking people :P
             continue;
         }
         if (IsValidClient(client))
@@ -135,14 +135,15 @@ public Action ShowInfoToPlayersAndPunish(Handle timer)
             if (proctimeThisSecondFor[client] > GetConVarFloat(sm_max_packet_processing_time_msec) / 1000)
             {
                 char hookmsg[256];
-                Format(hookmsg, sizeof(hookmsg), "[StopBadPackets] Client -%L- spent [%.2fms] in the last second processing a packet - sm_max_packet_processing_time_msec = %.2f", client, proctimeThisSecondFor[client]*1000.0, GetConVarFloat(sm_max_packet_processing_time_msec));
+                Format(hookmsg, sizeof(hookmsg), "[StopBadPackets] Client -%L- spent [%.2fms] over [%i] ticks in the last second processing a packet - sm_max_packet_processing_time_msec = %.2f",
+                    client, proctimeThisSecondFor[client]*1000.0, ticks[client], GetConVarFloat(sm_max_packet_processing_time_msec));
                 Discord_SendMessage("badpackets", hookmsg);
 
                 // KickClient(client, "[StopBadPackets] Client %N took too long to process a packet", client);
                 PrintToServer("%s", hookmsg);
             }
-            PrintToServer("%N - %f.", client, proctimeThisSecondFor[client] * 1000);
-            PrintToServer("%N - %i ticks.", client, ticks[client]);
+            // PrintToServer("%N - %f.", client, proctimeThisSecondFor[client] * 1000);
+            // PrintToServer("%N - %i ticks.", client, ticks[client]);
         }
         proctimeThisSecondFor[client] = 0.0;
         ticks[client] = 0;
@@ -182,12 +183,12 @@ public MRESReturn Detour_ProcessPacketPost(int pThis, DHookParam hParams)
 {
     StopProfiling(profiler);
     int client = GetClientFromThis(pThis);
-    // LogMessage("%N", client);
+
     if (IsValidClient(client))
     {
         ticks[client]++;
         proctimeThisSecondFor[client] += GetProfilerTime(profiler);
-        // LogMessage("%i %f %N", ticks[client], proctimeThisSecondFor[client], client);
+
     }
     return MRES_Ignored;
 
@@ -306,7 +307,7 @@ bool IsValidClient(int client)
 // This looks simple but it took literally 6 hours to figure out
 int GetClientFromThis(any pThis)
 {
-    if (pThis == NULL)
+    if (pThis == Address_Null)
     {
         LogMessage("pThis == NULL!")
         return 0;
@@ -314,7 +315,7 @@ int GetClientFromThis(any pThis)
     int offset  = GameConfGetOffset(hGameData, "Offset_MessageHandler");
     Address IClient = DerefPtr(pThis + offset );
     // Address IClient = pThis + offset;
-    if (IClient == NULL)
+    if (IClient == Address_Null)
     {
         LogMessage("IClient == NULL!")
         return 0;
