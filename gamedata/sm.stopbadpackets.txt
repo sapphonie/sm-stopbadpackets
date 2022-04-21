@@ -147,12 +147,12 @@
             "Offset_MessageHandler"
             {
                 "linux"     "0x1057"
-                "windows"   "0"
+                "windows"   "0x427C"
             }
             "CBaseClient::GetPlayerSlot"
             {
-                "linux"     "15"
-                "windows"   "14"
+                "linux"     "17"
+                "windows"   "16"
             }
         }
     }
