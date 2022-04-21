@@ -146,7 +146,8 @@
             // crashes
             "Offset_MessageHandler"
             {
-                "linux"     "0x1057"
+                // "linux"     "0x1057"
+                "linux"     "0x415C"
                 "windows"   "0x4160"
             }
             "CBaseClient::GetPlayerSlot"
