@@ -143,6 +143,7 @@
             {
                 "linux"     "0x54"
             }
+            // crashes
             "Offset_MessageHandler"
             {
                 "linux"     "0x1057"
