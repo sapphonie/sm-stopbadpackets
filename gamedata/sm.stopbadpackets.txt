@@ -148,7 +148,7 @@
             {
                 // "linux"     "0x1057"
                 "linux"     "0x415C"
-                "windows"   "0x4160"
+                "windows"   "0x1058"
             }
             "CBaseClient::GetPlayerSlot"
             {
