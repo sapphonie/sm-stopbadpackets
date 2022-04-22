@@ -1,19 +1,12 @@
+#pragma semicolon 1
+#pragma newdecls required
+
+
 #include <sdktools>
 #include <dhooks>
 #include <discord>
 #include <profiler>
 
-// each channel packet has 1 byte of FLAG bits
-#define PACKET_FLAG_RELIABLE            (1<<0)  // packet contains subchannel stream data
-#define PACKET_FLAG_COMPRESSED          (1<<1)  // packet is compressed
-#define PACKET_FLAG_ENCRYPTED           (1<<2)  // packet is encrypted
-#define PACKET_FLAG_SPLIT               (1<<3)  // packet is split
-#define PACKET_FLAG_CHOKED              (1<<4)  // packet was choked by sender
-#define PACKET_FLAG_CHALLENGE           (1<<5)  // packet contains challenge number, use to prevent packet injection
-#define PACKET_FLAG_IDK                 (1<<6)  // who freakin knows man
-
-// this should be a constant in sm...
-// Address NULL = view_as<Address>(0x0);
 
 
 Handle hGameData;
@@ -23,11 +16,25 @@ Handle SDKCall_GetPlayerSlot;
 Handle profiler;
 
 ConVar sm_max_bad_packets_sec;
+ConVar sm_max_bogon_sized_packets_sec;
+ConVar sm_max_pps_ratio;
 ConVar sm_max_packet_processing_time_msec;
 
 int evilPacketsFor          [MAXPLAYERS+1];
+int bogonSizedPacketsFor    [MAXPLAYERS+1];
+
 float proctimeThisSecondFor [MAXPLAYERS+1];
-int ticks                   [MAXPLAYERS+1];
+int packets                 [MAXPLAYERS+1];
+
+
+float TickInterval;
+float tps;
+
+
+// TODO TODO TODO
+// Sequence number checking
+// 
+
 
 public void OnPluginStart()
 {
@@ -49,7 +56,7 @@ public void OnPluginStart()
     }
 
     // post hook
-    if (!DHookEnableDetour(hProcessPacketHeader_Detour, true, Detour_ProcessPacketHeader))
+    if (!DHookEnableDetour(hProcessPacketHeader_Detour, true, Detour_ProcessPacketHeaderPost))
     {
         SetFailState("Failed to detour ProcessPacketHeader.");
     }
@@ -58,7 +65,6 @@ public void OnPluginStart()
     /*
         ProcessPacket
     */
-
     Handle hProcessPacket_Detour     = DHookCreateFromConf(hGameData, "ProcessPacket");
     Handle hProcessPacket_DetourPost = DHookCreateFromConf(hGameData, "ProcessPacket");
     if (!hProcessPacket_Detour || !hProcessPacket_DetourPost)
@@ -80,12 +86,21 @@ public void OnPluginStart()
     }
     PrintToServer("CNetChan::ProcessPacket hooked!");
 
+    /*
+        GetPlayerSlot
+    */
     StartPrepSDKCall(SDKCall_Raw);
     PrepSDKCall_SetFromConf(hGameData, SDKConf_Virtual, "CBaseClient::GetPlayerSlot");
     PrepSDKCall_SetReturnInfo(SDKType_PlainOldData, SDKPass_Plain);
     SDKCall_GetPlayerSlot = EndPrepSDKCall();
-    PrintToServer("CBaseClient::GetPlayerSlot set up!");
-
+    if (SDKCall_GetPlayerSlot != INVALID_HANDLE)
+    {
+        PrintToServer("CBaseClient::GetPlayerSlot set up!");
+    }
+    else
+    {
+        SetFailState("Failed to get CBaseClient::GetPlayerSlot offset.");
+    }
 
     sm_max_bad_packets_sec =
     CreateConVar
@@ -93,6 +108,32 @@ public void OnPluginStart()
         "sm_max_bad_packets_sec",
         "25",
         "[StopBadPackets] Max invalid packets a client is allowed to send, per second. Default 25.",
+        FCVAR_NONE,
+        true,
+        0.0,
+        false,
+        _
+    );
+
+    sm_max_bogon_sized_packets_sec =
+    CreateConVar
+    (
+        "sm_max_bogon_sized_packets_sec",
+        "25",
+        "[StopBadPackets] Max oddly sized packets ( <8 bytes or >2048 bytes ) a client is allowed to send, per second. Default 25.",
+        FCVAR_NONE,
+        true,
+        0.0,
+        false,
+        _
+    );
+
+    sm_max_pps_ratio =
+    CreateConVar
+    (
+        "sm_max_pps_ratio",
+        "2.5",
+        "[StopBadPackets] Max total packets that the client is allowed to send, as a ratio of the server's tickrate. Default 2.5(x), e.g. a client would have to send 160 packets per second to get kicked on a 64 tick server.",
         FCVAR_NONE,
         true,
         0.0,
@@ -113,44 +154,31 @@ public void OnPluginStart()
         _
     );
 
-    CreateTimer(1.0, CheckProcTime, _, TIMER_REPEAT);
+
+    CreateTimer(1.0, CheckPackets, _, TIMER_REPEAT);
+
+    TickInterval = GetTickInterval();
+    tps = 1 / TickInterval;
 
     profiler = CreateProfiler();
 }
 
-public Action CheckProcTime(Handle timer)
+public MRESReturn Detour_ProcessPacketHeaderPost(int pThis, DHookReturn hReturn, DHookParam hParams)
 {
-    for (int client = 1; client <= MaxClients; client++)
-    {
-        if (GetConVarFloat(sm_max_packet_processing_time_msec) == 0.0)
-        {
-            proctimeThisSecondFor[client] = 0.0;
-            ticks[client] = 0;
+    int ret = DHookGetReturn(hReturn);
 
-            // don't run the rest of this logic if there's no point in kicking people :P
-            continue;
-        }
+    // Packet was invalid somehow.
+    if (ret == -1)
+    {
+        int client = GetClientFromThis(pThis);
         if (IsValidClient(client))
         {
-            if (proctimeThisSecondFor[client] > GetConVarFloat(sm_max_packet_processing_time_msec) / 1000)
-            {
-                char hookmsg[256];
-                Format(hookmsg, sizeof(hookmsg), "[StopBadPackets] Client -%L- spent [%.2fms] over [%i] ticks in the last second processing a packet - sm_max_packet_processing_time_msec = %.2f",
-                    client, proctimeThisSecondFor[client]*1000.0, ticks[client], GetConVarFloat(sm_max_packet_processing_time_msec));
-                Discord_SendMessage("badpackets", hookmsg);
-
-                // KickClient(client, "[StopBadPackets] Client %N took too long to process a packet", client);
-                PrintToServer("%s", hookmsg);
-            }
-            // PrintToServer("%N - %f.", client, proctimeThisSecondFor[client] * 1000);
-            // PrintToServer("%N - %i ticks.", client, ticks[client]);
+            evilPacketsFor[client]++;
         }
-        proctimeThisSecondFor[client] = 0.0;
-        ticks[client] = 0;
     }
-    return Plugin_Continue;
-}
 
+    return MRES_Ignored;
+}
 
 public MRESReturn Detour_ProcessPacket(int pThis, DHookParam hParams)
 {
@@ -167,12 +195,8 @@ public MRESReturn Detour_ProcessPacket(int pThis, DHookParam hParams)
         int client = GetClientFromThis(pThis);
         if (IsValidClient(client))
         {
-            char hookmsg[256];
-            Format(hookmsg, sizeof(hookmsg), "[StopBadPackets] Client -%L- sent a packet with a sussy size: [%i]", client, size);
-            Discord_SendMessage("badpackets", hookmsg);
-            PrintToServer("%s", hookmsg);
-            // KickClient(client, "[StopBadPackets] Client %N sent a packet with a sussy size!", client);
-            // return MRES_Supercede;
+            bogonSizedPacketsFor[client]++;
+            return MRES_Supercede;
         }
     }
     return MRES_Ignored;
@@ -186,108 +210,92 @@ public MRESReturn Detour_ProcessPacketPost(int pThis, DHookParam hParams)
 
     if (IsValidClient(client))
     {
-        ticks[client]++;
+        packets[client]++;
         proctimeThisSecondFor[client] += GetProfilerTime(profiler);
-
     }
-    return MRES_Ignored;
-
-}
-
-public MRESReturn Detour_ProcessPacketHeader(int pThis, DHookReturn hReturn, DHookParam hParams)
-{
-    int ret             = DHookGetReturn(hReturn);
-    // Address netpacket   = DHookGetParamAddress(hParams, 1);
-
-    /*
-    char flags[64];
-    if (ret & PACKET_FLAG_RELIABLE)
-    {
-        StrCat(flags, sizeof(flags), "RELIABLE ");
-    }
-    if (ret & PACKET_FLAG_COMPRESSED)
-    {
-        StrCat(flags, sizeof(flags), "COMPRESSED ");
-    }
-    if (ret & PACKET_FLAG_ENCRYPTED)
-    {
-        StrCat(flags, sizeof(flags), "ENCRYPTED ");
-    }
-    if (ret & PACKET_FLAG_SPLIT)
-    {
-        StrCat(flags, sizeof(flags), "SPLIT ");
-    }
-    if (ret & PACKET_FLAG_CHOKED)
-    {
-        StrCat(flags, sizeof(flags), "CHOKED ");
-    }
-    if (ret & PACKET_FLAG_CHALLENGE)
-    {
-        StrCat(flags, sizeof(flags), "CHALLENGE ");
-    }
-    if (ret & PACKET_FLAG_IDK)
-    {
-        StrCat(flags, sizeof(flags), "UNKNOWN FLAG ");
-    }
-
-    LogMessage("processing packet header %i %s", ret, flags);
-
-    */
-
-
-    // Packet was invalid somehow.
-    if (ret == -1)
-    {
-        int client = GetClientFromThis(pThis);
-        evilPacketsFor[client]++;
-        PrintToServer("[StopBadPackets] Client %N sent an invalid packet. Detections within the last second: %i", client, evilPacketsFor[client]);
-
-        // expire this detection in 1 second
-        int userid = GetClientUserId(client);
-        CreateTimer(1.0, Timer_decr_BadPacket, userid, TIMER_FLAG_NO_MAPCHANGE);
-
-        if (evilPacketsFor[client] % 5 == 0)
-        {
-            char hookmsg[256];
-            Format(hookmsg, sizeof(hookmsg), "[StopBadPackets] Client -%L- sent too many invalid packets [%i]/s - sm_max_bad_packets_sec = %.2f", client, evilPacketsFor[client], GetConVarFloat(sm_max_bad_packets_sec));
-            Discord_SendMessage("badpackets", hookmsg);
-        }
-
-        if (evilPacketsFor[client] >= GetConVarFloat(sm_max_bad_packets_sec))
-        {
-            // KickClient(client, "[StopBadPackets] Client %N sent too many invalid packets", client);
-            PrintToServer("[StopBadPackets] Client %N sent too many invalid packets", client);
-        }
-    }
-
     return MRES_Ignored;
 }
 
-
-Action Timer_decr_BadPacket(Handle timer, any userid)
+public Action CheckPackets(Handle timer)
 {
-    int client = GetClientOfUserId(userid);
-
-    if (client)
+    for (int client = 1; client <= MaxClients; client++)
     {
-        if (evilPacketsFor[client] > 0)
+        if (IsValidClient(client))
         {
-            evilPacketsFor[client]--;
+            // Packet flood first
+            if (GetConVarFloat(sm_max_pps_ratio) > 0.0 && packets[client] >= (tps * GetConVarFloat(sm_max_pps_ratio)))
+            {
+                // char hookmsg[256];
+                // Format(hookmsg, sizeof(hookmsg),
+                //     "[StopBadPackets] Client -%L- sent [%i] packets in the last second - 2.5 x the server (%.2f) tps!",
+                //     client, ticks[client], tps);
+                // Discord_SendMessage("badpackets", hookmsg);
+
+                PrintToServer (        "[StopBadPackets] %N sent %i packets to the server in the last second! Kicking to prevent a server Dos", client, packets[client]);
+                PrintToChatAll(        "[StopBadPackets] %N sent %i packets to the server in the last second! Kicking to prevent a server Dos", client, packets[client]);
+                PrintToConsole(client, "[StopBadPackets] You sent %i packets to the server in the last second! You have been kicked to prevent a server DoS", packets[client]);
+                KickClient    (client, "[StopBadPackets] You sent %i packets to the server in the last second! You have been kicked to prevent a server DoS", packets[client]);
+            }
+
+            // Oddly sized packets next
+            else if (GetConVarFloat(sm_max_bogon_sized_packets_sec) > 0.0 && bogonSizedPacketsFor[client] >= GetConVarFloat(sm_max_bogon_sized_packets_sec))
+            {
+                PrintToServer (        "[StopBadPackets] %N sent %i oddly sized packets to the server in the last second! Kicking to prevent a server Dos", client, bogonSizedPacketsFor[client]);
+                PrintToChatAll(        "[StopBadPackets] %N sent %i oddly sized packets to the server in the last second! Kicking to prevent a server Dos", client, bogonSizedPacketsFor[client]);
+                PrintToConsole(client, "[StopBadPackets] You sent %i oddly sized packets to the server in the last second! You have been kicked to prevent a server DoS", bogonSizedPacketsFor[client]);
+                KickClient    (client, "[StopBadPackets] You sent %i oddly sized packets to the server in the last second! You have been kicked to prevent a server DoS", bogonSizedPacketsFor[client]);
+            }
+
+            // Invalid packets next
+            else if (GetConVarFloat(sm_max_bad_packets_sec) > 0.0 && evilPacketsFor[client] >= GetConVarFloat(sm_max_bad_packets_sec))
+            {
+                PrintToServer (        "[StopBadPackets] %N sent %i invalid packets to the server in the last second! Kicking to prevent a server Dos", client, evilPacketsFor[client]);
+                PrintToChatAll(        "[StopBadPackets] %N sent %i invalid packets to the server in the last second! Kicking to prevent a server Dos", client, evilPacketsFor[client]);
+                PrintToConsole(client, "[StopBadPackets] You sent %i invalid packets to the server in the last second! You have been kicked to prevent a server DoS", evilPacketsFor[client]);
+                KickClient    (client, "[StopBadPackets] You sent %i invalid packets to the server in the last second! You have been kicked to prevent a server DoS", evilPacketsFor[client]);
+            }
+
+            // Processing time last
+            else if (GetConVarFloat(sm_max_packet_processing_time_msec) > 0.0 && proctimeThisSecondFor[client] > GetConVarFloat(sm_max_packet_processing_time_msec) / 1000)
+            {
+                // char hookmsg[256];
+                // Format(hookmsg, sizeof(hookmsg),
+                //    "[StopBadPackets] Client -%L- spent [%.2fms] over [%i] ticks in the last second processing a packet - sm_max_packet_processing_time_msec = %.2f",
+                //    client, proctimeThisSecondFor[client]*1000.0, ticks[client], GetConVarFloat(sm_max_packet_processing_time_msec));
+                // Discord_SendMessage("badpackets", hookmsg);
+
+                PrintToServer(         "[StopBadPackets] The server spent %.2fms over %i packets in the past second processing network data from client %N. Kicking to prevent a server DoS",       proctimeThisSecondFor[client]*1000.0, packets[client], client);
+                PrintToChatAll(        "[StopBadPackets] The server spent %.2fms over %i packets in the past second processing network data from client %N. Kicking to prevent a server DoS",       proctimeThisSecondFor[client]*1000.0, packets[client], client);
+                PrintToConsole(client, "[StopBadPackets] The server spent %.2fms over %i packets in the last second processing your network packets. You have been kicked to prevent a server DoS", proctimeThisSecondFor[client]*1000.0, packets[client]);
+                KickClient    (client, "[StopBadPackets] The server spent %.2fms over %i packets in the last second processing your network packets. You have been kicked to prevent a server DoS", proctimeThisSecondFor[client]*1000.0, packets[client]);
+            }
+            // PrintToServer("%N - %fms.", client, proctimeThisSecondFor[client] * 1000);
+            // PrintToServer("%N - %i ticks.", client, ticks[client]);
+            // PrintToServer("%N - %i evilpackets.", client, evilPacketsFor[client]);
         }
+        resetVals(client);
     }
-    return Plugin_Handled;
+    return Plugin_Continue;
 }
 
 // client join
 public void OnClientPutInServer(int client)
 {
-    evilPacketsFor[client] = 0;
+    resetVals(client);
 }
 
 // player left and mapchanges
 public void OnClientDisconnect(int client)
 {
-    evilPacketsFor[client] = 0;
+    resetVals(client);
+}
+
+void resetVals(int client)
+{
+    proctimeThisSecondFor[client]   = 0.0;
+    packets[client]                 = 0;
+    evilPacketsFor[client]          = 0;
+    bogonSizedPacketsFor[client]    = 0;
 }
 
 bool IsValidClient(int client)
@@ -307,27 +315,22 @@ bool IsValidClient(int client)
 // This looks simple but it took literally 6 hours to figure out
 int GetClientFromThis(any pThis)
 {
+    // sanity check
     if (pThis == Address_Null)
     {
-        LogMessage("pThis == NULL!")
-        return 0;
+        return -1;
     }
     int offset  = GameConfGetOffset(hGameData, "Offset_MessageHandler");
-    Address IClient = DerefPtr(pThis + offset );
-    // Address IClient = pThis + offset;
+    Address IClient = DerefPtr(pThis + offset);
     if (IClient == Address_Null)
     {
-        LogMessage("IClient == NULL!")
-        return 0;
+        return -1;
     }
     int client = SDKCall(SDKCall_GetPlayerSlot, IClient) + 1;
     return client;
 }
 
-
 Address DerefPtr(Address addr)
 {
     return view_as<Address>(LoadFromAddress(addr, NumberType_Int32));
 }
-
-
