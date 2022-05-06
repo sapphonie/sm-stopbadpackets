@@ -146,7 +146,7 @@ void DoGamedata()
     PrepSDKCall_SetFromConf( hGameData, SDKConf_Virtual, "CBaseClient::GetPlayerSlot" );
     PrepSDKCall_SetReturnInfo( SDKType_PlainOldData, SDKPass_Plain );
     SDKCall_GetPlayerSlot = EndPrepSDKCall();
-    if ( SDKCall_GetPlayerSlot != INVALID_HANDLE)
+    if ( SDKCall_GetPlayerSlot != INVALID_HANDLE )
     {
         PrintToServer( "CBaseClient::GetPlayerSlot set up!" );
     }
@@ -234,11 +234,11 @@ void DoCvars()
 
 
     // Hook our cvars
-    HookConVarChange(sm_max_pps_ratio,                      OurCvarsChanged);
-    HookConVarChange(sm_max_pps_ratio_drop,                 OurCvarsChanged);
-    HookConVarChange(sm_max_bogon_sized_pps_ratio,          OurCvarsChanged);
-    HookConVarChange(sm_max_invalid_pps_ratio,              OurCvarsChanged);
-    HookConVarChange(sm_max_packet_processing_time_msec,    OurCvarsChanged);
+    HookConVarChange( sm_max_pps_ratio,                      OurCvarsChanged );
+    HookConVarChange( sm_max_pps_ratio_drop,                 OurCvarsChanged );
+    HookConVarChange( sm_max_bogon_sized_pps_ratio,          OurCvarsChanged );
+    HookConVarChange( sm_max_invalid_pps_ratio,              OurCvarsChanged );
+    HookConVarChange( sm_max_packet_processing_time_msec,    OurCvarsChanged );
 
     // Update our cvars
     OurCvarsChanged(null, "", "");
@@ -246,11 +246,11 @@ void DoCvars()
 
 void OurCvarsChanged( ConVar convar, const char[] oldValue, const char[] newValue )
 {
-    max_pps_ratio                   = GetConVarFloat(sm_max_pps_ratio);
-    max_pps_ratio_drop              = GetConVarFloat(sm_max_pps_ratio_drop);
-    max_bogon_sized_pps_ratio       = GetConVarFloat(sm_max_bogon_sized_pps_ratio);
-    max_invalid_pps_ratio           = GetConVarFloat(sm_max_invalid_pps_ratio);
-    max_packet_processing_time_msec = GetConVarFloat(sm_max_packet_processing_time_msec);
+    max_pps_ratio                   = GetConVarFloat( sm_max_pps_ratio );
+    max_pps_ratio_drop              = GetConVarFloat( sm_max_pps_ratio_drop );
+    max_bogon_sized_pps_ratio       = GetConVarFloat( sm_max_bogon_sized_pps_ratio );
+    max_invalid_pps_ratio           = GetConVarFloat( sm_max_invalid_pps_ratio );
+    max_packet_processing_time_msec = GetConVarFloat( sm_max_packet_processing_time_msec );
 }
 
 public void OnMapStart()
